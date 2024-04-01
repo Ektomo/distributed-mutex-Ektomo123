@@ -10,77 +10,93 @@ import java.util.*
  * @author Горбунов Иван //
  */
 class ProcessImpl(private val env: Environment) : Process {
-    private var counter = 0
-    private var ackCounter = 0
-    private var waitingForAck = mutableSetOf<Int>()
-    private val requestsQueue = PriorityQueue<Pair<Int, Int>>(compareBy({ it.first }, { it.second }))
+    private var logicalClock = 0
+    private val forksState = mutableMapOf<Int, Boolean>() // true если вилка у нас и она "грязная"
+    private var needCS = false // Флаг необходимости входа в критическую секцию
+    private var inCriticalSection = false
 
-    private fun incrementCounter() {
-        counter++
-    }
-
-    private fun broadcastRequest() {
+    init {
+        // Инициализируем состояние вилок на основе ID процессов
         for (i in 1..env.nProcesses) {
-            if (i != env.processId) {
-                env.send(i) {
-                    writeEnum(Type.REQ)
-                    writeInt(counter)
-                }
-            }
-        }
-    }
-
-    private fun checkAndEnterCriticalSection() {
-        if (waitingForAck.isEmpty() && (requestsQueue.isEmpty() || requestsQueue.peek().second == env.processId)) {
-            env.locked()
-            requestsQueue.poll()
-        }
-    }
-
-    private fun sendDeferredReplies() {
-        while (requestsQueue.isNotEmpty()) {
-            val (_, theirId) = requestsQueue.poll()
-            env.send(theirId) {
-                writeEnum(Type.OK)
+            if (i < env.processId) {
+                forksState[i] = true // У нас есть "грязная" вилка от процесса с меньшим ID
+            } else if (i > env.processId) {
+                forksState[i] = false // У процесса с большим ID есть "грязная" вилка
             }
         }
     }
 
     override fun onMessage(srcId: Int, message: Message) {
         message.parse {
-            val type = readEnum<Type>()
-            when (type) {
-                Type.REQ -> {
-                    val senderCounter = readInt() // Читаем счетчик процесса
-                    requestsQueue.offer(senderCounter to srcId)
-                    if (!waitingForAck.contains(env.processId) ||
-                        senderCounter < counter ||
-                        (senderCounter == counter && srcId < env.processId)) {
-                        env.send(srcId) {
-                            writeEnum(Type.OK)
-                            writeInt(senderCounter)
-                        }
+            val msgType = readEnum<MessageType>()
+            val msgTime = readInt()
+            logicalClock = max(logicalClock, msgTime) + 1
+            when (msgType) {
+                MessageType.REQ -> {
+                    if (forksState[srcId] == true && !needCS) {
+                        sendFork(srcId)
                     }
                 }
-                Type.OK -> {
-                    waitingForAck.remove(srcId)
-                    checkAndEnterCriticalSection()
+
+                MessageType.OK -> {
+                    forksState[srcId] = true // Помечаем вилку как полученную
+                    tryEnterCriticalSection()
                 }
             }
         }
     }
 
-
     override fun onLockRequest() {
-        incrementCounter()
-        waitingForAck.addAll((1..env.nProcesses).filter { it != env.processId })
-        broadcastRequest()
-        checkAndEnterCriticalSection()
+        needCS = true
+        requestForks()
+        tryEnterCriticalSection()
     }
 
     override fun onUnlockRequest() {
+        if (inCriticalSection) {
+            leaveCriticalSection()
+        }
+    }
+
+    private fun requestForks() {
+        for (i in forksState.keys) {
+            if (!forksState[i]!!) {
+                env.send(i, Message{
+                    writeEnum(MessageType.REQ)
+                    writeInt(logicalClock)
+                })
+            }
+        }
+    }
+
+
+    private fun sendFork(receiverId: Int) {
+        forksState[receiverId] = false // Убираем вилку у себя
+        env.send(receiverId, Message{
+            writeEnum(MessageType.OK)
+            writeInt(logicalClock)
+        })
+    }
+
+    private fun tryEnterCriticalSection() {
+        if (needCS && forksState.all { it.value }) {
+            // Все вилки у нас, входим в критическую секцию
+            env.locked()
+            inCriticalSection = true
+            needCS = false
+        }
+    }
+
+    private fun leaveCriticalSection() {
+        inCriticalSection = false
+        // После выхода из критической секции вилки остаются "грязными" и у нас
         env.unlocked()
-        sendDeferredReplies()
     }
 }
-enum class Type { REQ, OK }
+enum class MessageType {
+    REQ, OK
+}
+
+enum class ForkState {
+    CLEAN, DIRTY, NONE
+}
