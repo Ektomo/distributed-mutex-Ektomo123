@@ -2,6 +2,7 @@ package mutex
 
 import java.lang.Integer.max
 import java.util.*
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Distributed mutual exclusion implementation.
@@ -10,93 +11,106 @@ import java.util.*
  * @author Горбунов Иван //
  */
 class ProcessImpl(private val env: Environment) : Process {
-    private var logicalClock = 0
-    private val forksState = mutableMapOf<Int, Boolean>() // true если вилка у нас и она "грязная"
-    private var needCS = false // Флаг необходимости входа в критическую секцию
-    private var inCriticalSection = false
-
-    init {
-        // Инициализируем состояние вилок на основе ID процессов
-        for (i in 1..env.nProcesses) {
-            if (i < env.processId) {
-                forksState[i] = true // У нас есть "грязная" вилка от процесса с меньшим ID
-            } else if (i > env.processId) {
-                forksState[i] = false // У процесса с большим ID есть "грязная" вилка
-            }
-        }
-    }
+    private val clock = AtomicInteger(0)
+    private var state = State.THINKING
+    // Изначальное состояние вилок зависит от идентификатора процесса
+    private var hasLeftFork = env.processId % 2 == 0
+    private var hasRightFork = env.processId % 2 == 1
+    private var requestedLeftFork = false
+    private var requestedRightFork = false
 
     override fun onMessage(srcId: Int, message: Message) {
         message.parse {
-            val msgType = readEnum<MessageType>()
             val msgTime = readInt()
-            logicalClock = max(logicalClock, msgTime) + 1
-            when (msgType) {
-                MessageType.REQ -> {
-                    if (forksState[srcId] == true && !needCS) {
-                        sendFork(srcId)
+            val type = readEnum<MsgType>()
+            clock.updateAndGet { current -> max(current, msgTime) + 1 }
+            when (type) {
+                MsgType.REQ -> {
+                    // Если процесс находится в критической секции или ожидает входа и имеет вилку, он не отдаёт её сразу.
+                    if ((state == State.HUNGRY || state == State.EATING) && (hasLeftFork && srcId == leftNeighbor() || hasRightFork && srcId == rightNeighbor())) {
+                        return@parse // Процесс ожидает возможности поесть и не отдаёт вилку.
                     }
+                    sendFork(srcId)
                 }
-
-                MessageType.OK -> {
-                    forksState[srcId] = true // Помечаем вилку как полученную
-                    tryEnterCriticalSection()
+                MsgType.OK -> {
+                    if (srcId == leftNeighbor()) {
+                        hasLeftFork = true
+                        requestedLeftFork = false
+                    }
+                    if (srcId == rightNeighbor()) {
+                        hasRightFork = true
+                        requestedRightFork = false
+                    }
+                    tryToEat()
                 }
             }
         }
     }
 
     override fun onLockRequest() {
-        needCS = true
+        state = State.HUNGRY
+        tryToEat()
         requestForks()
-        tryEnterCriticalSection()
     }
 
     override fun onUnlockRequest() {
-        if (inCriticalSection) {
-            leaveCriticalSection()
+        state = State.THINKING
+        // Помечаем вилки как "грязные", но не отправляем их автоматически.
+        // Вилки будут отправлены только при получении запроса от соседа.
+        if (!hasLeftFork) requestedLeftFork = false
+        if (!hasRightFork) requestedRightFork = false
+        env.unlocked()
+        tryToSendForks()
+    }
+
+    private fun leftNeighbor() = if (env.processId == 1) env.nProcesses else env.processId - 1
+    private fun rightNeighbor() = if (env.processId == env.nProcesses) 1 else env.processId + 1
+
+    private fun tryToEat() {
+        if (state == State.HUNGRY && hasLeftFork && hasRightFork) {
+            state = State.EATING
+            env.locked()
         }
     }
 
     private fun requestForks() {
-        for (i in forksState.keys) {
-            if (!forksState[i]!!) {
-                env.send(i, Message{
-                    writeEnum(MessageType.REQ)
-                    writeInt(logicalClock)
-                })
-            }
+        if (!hasLeftFork && !requestedLeftFork) {
+            requestedLeftFork = true
+            sendReq(leftNeighbor())
+        }
+        if (!hasRightFork && !requestedRightFork) {
+            requestedRightFork = true
+            sendReq(rightNeighbor())
         }
     }
 
-
-    private fun sendFork(receiverId: Int) {
-        forksState[receiverId] = false // Убираем вилку у себя
-        env.send(receiverId, Message{
-            writeEnum(MessageType.OK)
-            writeInt(logicalClock)
-        })
-    }
-
-    private fun tryEnterCriticalSection() {
-        if (needCS && forksState.all { it.value }) {
-            // Все вилки у нас, входим в критическую секцию
-            env.locked()
-            inCriticalSection = true
-            needCS = false
+    private fun tryToSendForks() {
+        if (hasLeftFork && !requestedLeftFork) {
+            sendFork(leftNeighbor())
+        }
+        if (hasRightFork && !requestedRightFork) {
+            sendFork(rightNeighbor())
         }
     }
 
-    private fun leaveCriticalSection() {
-        inCriticalSection = false
-        // После выхода из критической секции вилки остаются "грязными" и у нас
-        env.unlocked()
+    private fun sendReq(destId: Int) {
+        env.send(destId) {
+            writeInt(clock.incrementAndGet())
+            writeEnum(MsgType.REQ)
+        }
     }
-}
-enum class MessageType {
-    REQ, OK
+
+    private fun sendFork(destId: Int) {
+        if (destId == leftNeighbor()) hasLeftFork = false
+        if (destId == rightNeighbor()) hasRightFork = false
+        env.send(destId) {
+            writeInt(clock.incrementAndGet())
+            writeEnum(MsgType.OK)
+        }
+    }
+
+    enum class State { THINKING, HUNGRY, EATING }
+    enum class MsgType { REQ, OK }
 }
 
-enum class ForkState {
-    CLEAN, DIRTY, NONE
-}
+
