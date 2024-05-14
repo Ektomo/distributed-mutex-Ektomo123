@@ -115,7 +115,6 @@ class ProcessImpl(private val env: Environment) : Process {
         }
     }
 }
-
 enum class Type { REQ, OK }
 
 data class Fork(var holder: Int, var dirty: Boolean)
