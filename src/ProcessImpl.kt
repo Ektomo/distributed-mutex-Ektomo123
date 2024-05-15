@@ -19,11 +19,10 @@ class ProcessImpl(private val env: Environment) : Process {
     private var logicalClock = 0
 
     init {
-        // Инициализация вилок в виде ациклического графа
         val n = env.nProcesses
         for (i in 1..n) {
             if (i < env.processId) {
-                forks[i] = Fork(env.processId, true)
+                forks[i] = Fork(env.processId, false)
             } else if (i > env.processId) {
                 forks[i] = Fork(i, true)
             }
@@ -31,67 +30,70 @@ class ProcessImpl(private val env: Environment) : Process {
     }
 
     override fun onMessage(srcId: Int, message: Message) {
-        message.parse {
-            val time = readInt()
-            val type = readEnum<Type>()
-            logicalClock = maxOf(logicalClock, time) + 1
+        synchronized(this) {
+            message.parse {
+                val time = readInt()
+                val type = readEnum<Type>()
+                logicalClock = maxOf(logicalClock, time) + 1
 
-            when (type) {
-                Type.REQ -> handleRequest(srcId, time)
-                Type.OK -> handleOk(srcId)
+                when (type) {
+                    Type.REQ -> handleRequest(srcId, time)
+                    Type.OK -> handleOk(srcId)
+                }
             }
         }
     }
 
     override fun onLockRequest() {
-        if (requesting || inCriticalSection) {
-            return
-        }
-        requesting = true
-        logicalClock++
-        for (i in 1..env.nProcesses) {
-            if (i != env.processId && forks[i]?.holder != env.processId) {
-                env.send(i) {
-                    writeInt(logicalClock)
-                    writeEnum(Type.REQ)
+        synchronized(this) {
+            if (requesting || inCriticalSection) {
+                return
+            }
+            requesting = true
+            logicalClock++
+            for (i in 1..env.nProcesses) {
+                if (i != env.processId && (forks[i]?.holder != env.processId || forks[i]?.dirty == true)) {
+                    env.send(i) {
+                        writeInt(logicalClock)
+                        writeEnum(Type.REQ)
+                    }
                 }
             }
+            checkCriticalSection()
         }
-        checkCriticalSection()
     }
 
     override fun onUnlockRequest() {
-        if (!inCriticalSection) {
-            return
-        }
-        env.unlocked()
-        inCriticalSection = false
-        requesting = false
-        for ((id, fork) in forks) {
-            if (fork.dirty && fork.holder == env.processId && queue.any { it.srcId == id }) {
-                fork.dirty = false
-                fork.holder = id
-                env.send(id) {
-                    writeInt(logicalClock)
-                    writeEnum(Type.OK)
-                }
+        synchronized(this) {
+            if (!inCriticalSection) {
+                return
             }
+            env.unlocked()
+            inCriticalSection = false
+            requesting = false
+            processQueue()
         }
-        processQueue()
     }
 
     private fun handleRequest(srcId: Int, time: Int) {
-        queue.add(Request(time, srcId))
-        processQueue()
+        synchronized(this) {
+            queue.add(Request(time, srcId))
+            processQueue()
+        }
     }
 
     private fun handleOk(srcId: Int) {
-        forks[srcId]?.holder = env.processId
-        checkCriticalSection()
+        synchronized(this) {
+            forks[srcId]?.apply {
+                holder = env.processId
+                dirty = false
+            }
+            checkCriticalSection()
+        }
     }
 
     private fun checkCriticalSection() {
-        if (requesting && forks.all { it.value.holder == env.processId }) {
+        if (requesting && forks.all { it.value.holder == env.processId && !it.value.dirty }) {
             inCriticalSection = true
             env.locked()
         }
@@ -102,7 +104,7 @@ class ProcessImpl(private val env: Environment) : Process {
             val req = queue.peek()
             val fork = forks[req.srcId]
             if (fork != null && fork.holder == env.processId && !requesting) {
-                fork.dirty = false
+                fork.dirty = true
                 fork.holder = req.srcId
                 queue.poll()
                 env.send(req.srcId) {
