@@ -19,88 +19,74 @@ class ProcessImpl(private val env: Environment) : Process {
     private var logicalClock = 0
 
     init {
-        // Инициализация вилок в виде ациклического графа
         val n = env.nProcesses
         for (i in 1..n) {
             if (i < env.processId) {
                 forks[i] = Fork(env.processId, true)
             } else if (i > env.processId) {
-                forks[i] = Fork(i, false)
+                forks[i] = Fork(i, true)
             }
         }
     }
 
     override fun onMessage(srcId: Int, message: Message) {
-        synchronized(this) {
-            message.parse {
-                val time = readInt()
-                val type = readEnum<Type>()
-                logicalClock = maxOf(logicalClock, time) + 1
+        message.parse {
+            val time = readInt()
+            val type = readEnum<Type>()
+            logicalClock = maxOf(logicalClock, time) + 1
 
-                when (type) {
-                    Type.REQ -> handleRequest(srcId, time)
-                    Type.OK -> handleOk(srcId)
-                }
+            when (type) {
+                Type.REQ -> handleRequest(srcId, time)
+                Type.OK -> handleOk(srcId)
             }
         }
     }
 
     override fun onLockRequest() {
-        synchronized(this) {
-            if (requesting || inCriticalSection) {
-                return
-            }
-            requesting = true
-            logicalClock++
-            for (i in 1..env.nProcesses) {
-                if (i != env.processId && forks[i]?.holder != env.processId) {
-                    env.send(i) {
-                        writeInt(logicalClock)
-                        writeEnum(Type.REQ)
-                    }
+        if (requesting || inCriticalSection) {
+            return
+        }
+        requesting = true
+        logicalClock++
+        for (i in 1..env.nProcesses) {
+            if (i != env.processId && forks[i]?.holder != env.processId) {
+                env.send(i) {
+                    writeInt(logicalClock)
+                    writeEnum(Type.REQ)
                 }
             }
-            checkCriticalSection()
         }
+        checkCriticalSection()
     }
 
     override fun onUnlockRequest() {
-        synchronized(this) {
-            if (!inCriticalSection) {
-                return
-            }
-            env.unlocked()
-            inCriticalSection = false
-            requesting = false
-            for ((id, fork) in forks) {
-                if (fork.dirty && fork.holder == env.processId && queue.any { it.srcId == id }) {
-                    fork.dirty = false
-                    fork.holder = id
-                    env.send(id) {
-                        writeInt(logicalClock)
-                        writeEnum(Type.OK)
-                    }
+        if (!inCriticalSection) {
+            return
+        }
+        env.unlocked()
+        inCriticalSection = false
+        requesting = false
+        for ((id, fork) in forks) {
+            if (fork.dirty && fork.holder == env.processId && queue.any { it.srcId == id }) {
+                fork.dirty = false
+                fork.holder = id
+                env.send(id) {
+                    writeInt(logicalClock)
+                    writeEnum(Type.OK)
                 }
             }
-            processQueue()
         }
+        processQueue()
     }
 
     private fun handleRequest(srcId: Int, time: Int) {
-        synchronized(this) {
-            queue.add(Request(time, srcId))
-            processQueue()
-        }
+        queue.add(Request(time, srcId))
+        processQueue()
     }
 
     private fun handleOk(srcId: Int) {
-        synchronized(this) {
-            forks[srcId]?.apply {
-                holder = env.processId
-                dirty = false
-            }
-            checkCriticalSection()
-        }
+        forks[srcId]?.holder = env.processId
+        checkCriticalSection()
     }
 
     private fun checkCriticalSection() {
