@@ -19,6 +19,7 @@ class ProcessImpl(private val env: Environment) : Process {
     private var logicalClock = 0
 
     init {
+        // Инициализация вилок в виде ациклического графа
         val n = env.nProcesses
         for (i in 1..n) {
             if (i < env.processId) {
@@ -71,6 +72,16 @@ class ProcessImpl(private val env: Environment) : Process {
             env.unlocked()
             inCriticalSection = false
             requesting = false
+            for ((id, fork) in forks) {
+                if (fork.dirty && fork.holder == env.processId && queue.any { it.srcId == id }) {
+                    fork.dirty = false
+                    fork.holder = id
+                    env.send(id) {
+                        writeInt(logicalClock)
+                        writeEnum(Type.OK)
+                    }
+                }
+            }
             processQueue()
         }
     }
