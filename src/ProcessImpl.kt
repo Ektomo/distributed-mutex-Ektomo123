@@ -19,6 +19,7 @@ class ProcessImpl(private val env: Environment) : Process {
     private var logicalClock = 0
 
     init {
+        // Инициализация вилок в виде ориентированного графа
         val n = env.nProcesses
         for (i in 1..n) {
             if (i < env.processId) {
