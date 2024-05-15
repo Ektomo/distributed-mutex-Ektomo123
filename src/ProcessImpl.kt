@@ -22,9 +22,9 @@ class ProcessImpl(private val env: Environment) : Process {
         val n = env.nProcesses
         for (i in 1..n) {
             if (i < env.processId) {
-                forks[i] = Fork(env.processId, false)
+                forks[i] = Fork(env.processId, true)
             } else if (i > env.processId) {
-                forks[i] = Fork(i, true)
+                forks[i] = Fork(i, false)
             }
         }
     }
@@ -52,7 +52,7 @@ class ProcessImpl(private val env: Environment) : Process {
             requesting = true
             logicalClock++
             for (i in 1..env.nProcesses) {
-                if (i != env.processId && (forks[i]?.holder != env.processId || forks[i]?.dirty == true)) {
+                if (i != env.processId && forks[i]?.holder != env.processId) {
                     env.send(i) {
                         writeInt(logicalClock)
                         writeEnum(Type.REQ)
@@ -93,7 +93,7 @@ class ProcessImpl(private val env: Environment) : Process {
     }
 
     private fun checkCriticalSection() {
-        if (requesting && forks.all { it.value.holder == env.processId && !it.value.dirty }) {
+        if (requesting && forks.all { it.value.holder == env.processId }) {
             inCriticalSection = true
             env.locked()
         }
@@ -104,7 +104,7 @@ class ProcessImpl(private val env: Environment) : Process {
             val req = queue.peek()
             val fork = forks[req.srcId]
             if (fork != null && fork.holder == env.processId && !requesting) {
-                fork.dirty = true
+                fork.dirty = false
                 fork.holder = req.srcId
                 queue.poll()
                 env.send(req.srcId) {
